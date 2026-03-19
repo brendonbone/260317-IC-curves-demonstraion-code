@@ -5,7 +5,7 @@ capacity from Q = I * t (using measured current/time), and plots:
 1) V-Q curves for representative cycles,
 2) raw IC curves,
 3) filtered IC curves,
-4) capacity trend across all discharge cycles.
+4) SOH (State of Health) trend across all discharge cycles.
 """
 
 from __future__ import annotations
@@ -136,6 +136,14 @@ def pick_representative_indices(total_count: int, n_select: int) -> list[int]:
     return selected
 
 
+def get_cycle_capacity_value(cycle: dict[str, np.ndarray | float | int]) -> float:
+    """Return preferred scalar cycle capacity (MAT field when available)."""
+    capacity_field_ah = float(cycle["capacity_field_ah"])
+    if np.isfinite(capacity_field_ah):
+        return capacity_field_ah
+    return float(cycle["capacity_end_ah"])
+
+
 def compute_ic_curve(
     voltage_v: np.ndarray,
     capacity_ah: np.ndarray,
@@ -193,9 +201,10 @@ def plot_results(
 
     fig_vq, ax_vq = plt.subplots(figsize=(10, 5.5))
     for color, cycle in zip(colors, selected_cycles):
+        capacity_value_ah = get_cycle_capacity_value(cycle)
         label = (
             f"Discharge #{int(cycle['discharge_index']) + 1} "
-            f"(Q_end={float(cycle['capacity_end_ah']):.3f} Ah)"
+            f"(Capacity={capacity_value_ah:.3f} Ah)"
         )
         ax_vq.plot(cycle["capacity_ah"], cycle["voltage_v"], color=color, linewidth=1.8, label=label)
     ax_vq.set_title(f"{battery_key}: V-Q Curves for Representative Discharge Cycles")
@@ -228,24 +237,109 @@ def plot_results(
 
     fig_cap, ax_cap = plt.subplots(figsize=(10, 4.8))
     discharge_numbers = np.arange(1, len(all_discharge_cycles) + 1)
-    cap_integrated = np.array([float(c["capacity_end_ah"]) for c in all_discharge_cycles])
     cap_field = np.array([float(c["capacity_field_ah"]) for c in all_discharge_cycles])
+    cap_trend = np.array([get_cycle_capacity_value(c) for c in all_discharge_cycles])
+    trend_label = "Capacity field"
 
-    ax_cap.plot(discharge_numbers, cap_integrated, linewidth=1.6, color="#005f73", label="Integrated Q_end")
-    if np.isfinite(cap_field).any():
-        ax_cap.plot(discharge_numbers, cap_field, linewidth=1.2, color="#94a1b2", label="Capacity field")
+    if not np.isfinite(cap_field).all():
+        trend_label = "Capacity field (fallback to integrated where missing)"
+
+    # Compute SOH as percentage relative to first cycle capacity
+    reference_capacity = float(cap_trend[0])
+    soh_trend = 100.0 * cap_trend / reference_capacity
+
+    ax_cap.plot(discharge_numbers, soh_trend, linewidth=1.6, color="#005f73", label=trend_label)
 
     highlighted_x = [int(all_discharge_cycles[i]["discharge_index"]) + 1 for i in selected_indices]
-    highlighted_y = [float(all_discharge_cycles[i]["capacity_end_ah"]) for i in selected_indices]
+    highlighted_y = [float(soh_trend[i]) for i in selected_indices]
     ax_cap.scatter(highlighted_x, highlighted_y, color="#bb3e03", s=45, zorder=3, label="Selected cycles")
 
     ax_cap.set_title(f"{battery_key}: Discharge Capacity Trend")
     ax_cap.set_xlabel("Discharge cycle number")
-    ax_cap.set_ylabel("Capacity (Ah)")
+    ax_cap.set_ylabel("SOH (%)")
     ax_cap.grid(alpha=0.3)
     ax_cap.legend(loc="best")
     fig_cap.tight_layout()
     fig_cap.savefig(output_dir / f"{battery_key}_capacity_trend.png", dpi=220)
+
+
+def plot_soh_trend_no_selected(
+    battery_key: str,
+    all_discharge_cycles: list[dict[str, np.ndarray | float | int]],
+    output_dir: Path,
+) -> None:
+    """Plot SOH trend without selected cycle indicators."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fig_cap, ax_cap = plt.subplots(figsize=(10, 4.8))
+    discharge_numbers = np.arange(1, len(all_discharge_cycles) + 1)
+    cap_trend = np.array([get_cycle_capacity_value(c) for c in all_discharge_cycles])
+
+    # Compute SOH as percentage relative to first cycle capacity
+    reference_capacity = float(cap_trend[0])
+    soh_trend = 100.0 * cap_trend / reference_capacity
+
+    ax_cap.plot(discharge_numbers, soh_trend, linewidth=1.6, color="#005f73", label="SOH trend")
+
+    ax_cap.set_title(f"{battery_key}: Discharge Capacity Trend")
+    ax_cap.set_xlabel("Discharge cycle number")
+    ax_cap.set_ylabel("SOH (%)")
+    ax_cap.grid(alpha=0.3)
+    ax_cap.legend(loc="best")
+    fig_cap.tight_layout()
+    fig_cap.savefig(output_dir / f"{battery_key}_capacity_trend_no_selected.png", dpi=220)
+
+
+def plot_all_batteries_soh_trend(
+    data_dir: Path,
+    output_dir: Path,
+) -> None:
+    """Plot SOH trends for all batteries on the same figure."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    color_map = {
+        "B0005": "#005f73",
+        "B0006": "#ae2012",
+        "B0007": "#9003bb",
+        "B0018": "#ee9b00",
+    }
+
+    fig_all, ax_all = plt.subplots(figsize=(12, 5.5))
+
+    for mat_filename in sorted(data_dir.glob("*.mat")):
+        battery_key = mat_filename.stem
+        if battery_key not in color_map:
+            continue
+
+        try:
+            battery_struct, _ = load_battery_struct(mat_filename, battery_key)
+            discharge_cycles = extract_discharge_cycles(battery_struct)
+            if not discharge_cycles:
+                continue
+
+            cap_trend = np.array([get_cycle_capacity_value(c) for c in discharge_cycles])
+            reference_capacity = float(cap_trend[0])
+            soh_trend = 100.0 * cap_trend / reference_capacity
+            discharge_numbers = np.arange(1, len(discharge_cycles) + 1)
+
+            ax_all.plot(
+                discharge_numbers,
+                soh_trend,
+                linewidth=2.0,
+                color=color_map[battery_key],
+                label=battery_key,
+            )
+        except Exception as exc:
+            print(f"Warning: Could not load {battery_key}: {exc}")
+            continue
+
+    ax_all.set_title("All Batteries: Discharge Capacity Trend (SOH)")
+    ax_all.set_xlabel("Discharge cycle number")
+    ax_all.set_ylabel("SOH (%)")
+    ax_all.grid(alpha=0.3)
+    ax_all.legend(loc="best", fontsize=10)
+    fig_all.tight_layout()
+    fig_all.savefig(output_dir / "all_batteries_soh_trend.png", dpi=220)
 
 
 def parse_args() -> argparse.Namespace:
@@ -321,20 +415,41 @@ def main() -> None:
         output_dir=args.output_dir,
     )
 
+    # Plot B0005 SOH trend without selected cycles
+    if battery_key == "B0005":
+        plot_soh_trend_no_selected(
+            battery_key=battery_key,
+            all_discharge_cycles=discharge_cycles,
+            output_dir=args.output_dir,
+        )
+
+    # Plot all batteries' SOH trends on the same figure
+    data_dir = Path("1. BatteryAgingARC-FY08Q4")
+    if data_dir.exists():
+        plot_all_batteries_soh_trend(
+            data_dir=data_dir,
+            output_dir=args.output_dir,
+        )
+
     print(f"Battery key: {battery_key}")
     print(f"Total discharge cycles found: {len(discharge_cycles)}")
     print("Selected representative discharge cycles:")
     for idx in selected:
         cycle = discharge_cycles[idx]
+        capacity_value_ah = get_cycle_capacity_value(cycle)
         print(
             f"  - Discharge #{int(cycle['discharge_index']) + 1}: "
-            f"Q_end={float(cycle['capacity_end_ah']):.3f} Ah"
+            f"Capacity={capacity_value_ah:.3f} Ah"
         )
 
     print("\nSaved plots:")
     print(f"  - {args.output_dir / f'{battery_key}_vq_representative_cycles.png'}")
     print(f"  - {args.output_dir / f'{battery_key}_ic_raw_vs_filtered.png'}")
     print(f"  - {args.output_dir / f'{battery_key}_capacity_trend.png'}")
+    if battery_key == "B0005":
+        print(f"  - {args.output_dir / f'{battery_key}_capacity_trend_no_selected.png'}")
+    if data_dir.exists():
+        print(f"  - {args.output_dir / 'all_batteries_soh_trend.png'}")
 
     if args.show:
         plt.show()
